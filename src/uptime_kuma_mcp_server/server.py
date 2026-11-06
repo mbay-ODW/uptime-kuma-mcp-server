@@ -10,9 +10,10 @@ import logging
 import os
 from typing import Any
 
-import mcp.server.stdio
+import jsonschema
 import mcp.types as types
-from mcp.server import Server
+from mcp.server import Server, ServerRequestContext
+from mcp.server.stdio import stdio_server
 
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -22,27 +23,17 @@ logging.basicConfig(
 
 from . import client  # noqa: E402
 
-server = Server(
-    "uptime-kuma-mcp-server",
-    instructions=(
-        "MCP-Server für selbst gehostetes Uptime Kuma. Listet und manipuliert "
-        "Monitore, holt Heartbeats und Uptime-Statistiken, verwaltet Status-Pages."
-    ),
-)
-
-
-@server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="uptime_list_monitors",
             description="Listet alle konfigurierten Monitore mit Type, URL, Status.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="uptime_get_monitor",
             description="Voll-Details zu einem Monitor inkl. Settings, Notifications, Tags.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"monitor_id": {"type": "integer"}},
                 "required": ["monitor_id"],
@@ -51,7 +42,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="uptime_pause_monitor",
             description="Pausiert einen Monitor (kein Check mehr).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"monitor_id": {"type": "integer"}},
                 "required": ["monitor_id"],
@@ -60,7 +51,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="uptime_resume_monitor",
             description="Reaktiviert einen pausierten Monitor.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"monitor_id": {"type": "integer"}},
                 "required": ["monitor_id"],
@@ -69,7 +60,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="uptime_delete_monitor",
             description="Löscht einen Monitor permanent.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"monitor_id": {"type": "integer"}},
                 "required": ["monitor_id"],
@@ -82,7 +73,7 @@ async def list_tools() -> list[types.Tool]:
                 "port (TCP-Port-Check) / ping (ICMP) / dns / keyword / docker. "
                 "Je nach Type brauchst du url, hostname+port, oder hostname allein."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
@@ -126,7 +117,7 @@ async def list_tools() -> list[types.Tool]:
                 "Letzte Heartbeats. Mit monitor_id: letzte 24h dieses Monitors. "
                 "Ohne: aktuelle Heartbeats aller Monitore."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"monitor_id": {"type": "integer"}},
             },
@@ -134,22 +125,22 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="uptime_get_uptime_stats",
             description="Aktuelle Uptime-Prozent-Werte je Monitor (24h / 30d).",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="uptime_get_avg_response",
             description="Durchschnittliche Antwortzeit je Monitor.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="uptime_list_status_pages",
             description="Listet alle Status-Pages (Public Dashboards).",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="uptime_get_status_page",
             description="Voll-Details einer Status-Page (Slug = URL-Pfad).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"slug": {"type": "string"}},
                 "required": ["slug"],
@@ -158,27 +149,26 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="uptime_list_notifications",
             description="Listet alle konfigurierten Notification-Channels (Discord, Telegram, ntfy, …).",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="uptime_list_tags",
             description="Listet alle Tags.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="uptime_list_maintenances",
             description="Listet konfigurierte Maintenance-Fenster.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="uptime_get_info",
             description="Server-Info (Version, Latency, Primary-Base-URL).",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
     ]
 
 
-@server.call_tool()
 async def call_tool(
     name: str, arguments: dict[str, Any]
 ) -> list[types.TextContent]:
@@ -236,13 +226,61 @@ async def _dispatch(name: str, a: dict[str, Any]) -> Any:
     raise ValueError(f"Unbekanntes Tool: {name}")
 
 
+async def _on_list_tools(
+    ctx: ServerRequestContext, params: types.PaginatedRequestParams | None
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=await list_tools())
+
+
+def _error_result(text: str) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=text)], is_error=True
+    )
+
+
+async def _on_call_tool(
+    ctx: ServerRequestContext, params: types.CallToolRequestParams
+) -> types.CallToolResult:
+    """mcp 2.x prueft Argumente nicht mehr und wandelt Exceptions nicht mehr um."""
+    arguments = params.arguments or {}
+    tool = next((t for t in await list_tools() if t.name == params.name), None)
+    if tool is not None:
+        try:
+            jsonschema.validate(arguments, tool.input_schema)
+        except jsonschema.ValidationError as exc:
+            return _error_result(f"Input validation error: {exc.message}")
+    try:
+        content = await call_tool(params.name, arguments)
+    except Exception as exc:
+        return _error_result(str(exc))
+    return types.CallToolResult(content=content, is_error=False)
+
+
+server = Server(
+    "uptime-kuma-mcp-server",
+    instructions=(
+        "MCP-Server für selbst gehostetes Uptime Kuma. Listet und manipuliert "
+        "Monitore, holt Heartbeats und Uptime-Statistiken, verwaltet Status-Pages."
+    ),
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+)
+
+
 def main() -> None:
     import asyncio
 
     if os.getenv("MCP_TRANSPORT", "stdio") == "sse":
         _run_sse()
     else:
-        asyncio.run(mcp.server.stdio.run_server(server))
+        asyncio.run(_run_stdio())
+
+
+async def _run_stdio() -> None:
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream, write_stream, server.create_initialization_options()
+        )
 
 
 def _run_sse() -> None:
